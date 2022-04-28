@@ -17,6 +17,7 @@ package com.google.cloud.teleport.templates;
 
 import static com.google.cloud.teleport.templates.TextToBigQueryStreaming.wrapBigQueryInsertError;
 
+import org.joda.time.Duration;
 import com.google.api.services.bigquery.model.TableRow;
 import com.google.cloud.teleport.coders.FailsafeElementCoder;
 import com.google.cloud.teleport.templates.common.BigQueryConverters.FailsafeJsonToTableRow;
@@ -34,6 +35,7 @@ import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.PipelineResult;
 import org.apache.beam.sdk.coders.CoderRegistry;
 import org.apache.beam.sdk.coders.StringUtf8Coder;
+import org.apache.beam.sdk.io.GenerateSequence;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO.Write.CreateDisposition;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO.Write.WriteDisposition;
@@ -61,68 +63,7 @@ import org.apache.beam.sdk.values.TupleTag;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/**
- * The {@link PubSubToBigQuery} pipeline is a streaming pipeline which ingests data in JSON format
- * from Cloud Pub/Sub, executes a UDF, and outputs the resulting records to BigQuery. Any errors
- * which occur in the transformation of the data or execution of the UDF will be output to a
- * separate errors table in BigQuery. The errors table will be created if it does not exist prior to
- * execution. Both output and error tables are specified by the user as template parameters.
- *
- * <p><b>Pipeline Requirements</b>
- *
- * <ul>
- *   <li>The Pub/Sub topic exists.
- *   <li>The BigQuery output table exists.
- * </ul>
- *
- * <p><b>Example Usage</b>
- *
- * <pre>
- * # Set the pipeline vars
- * PROJECT_ID=PROJECT ID HERE
- * BUCKET_NAME=BUCKET NAME HERE
- * PIPELINE_FOLDER=gs://${BUCKET_NAME}/dataflow/pipelines/pubsub-to-bigquery
- * USE_SUBSCRIPTION=true or false depending on whether the pipeline should read
- *                  from a Pub/Sub Subscription or a Pub/Sub Topic.
- *
- * # Set the runner
- * RUNNER=DataflowRunner
- *
- * # Build the template
- * mvn compile exec:java \
- * -Dexec.mainClass=com.google.cloud.teleport.templates.PubSubToBigQuery \
- * -Dexec.cleanupDaemonThreads=false \
- * -Dexec.args=" \
- * --project=${PROJECT_ID} \
- * --stagingLocation=${PIPELINE_FOLDER}/staging \
- * --tempLocation=${PIPELINE_FOLDER}/temp \
- * --templateLocation=${PIPELINE_FOLDER}/template \
- * --runner=${RUNNER}
- * --useSubscription=${USE_SUBSCRIPTION}
- * "
- *
- * # Execute the template
- * JOB_NAME=pubsub-to-bigquery-$USER-`date +"%Y%m%d-%H%M%S%z"`
- *
- * # Execute a pipeline to read from a Topic.
- * gcloud dataflow jobs run ${JOB_NAME} \
- * --gcs-location=${PIPELINE_FOLDER}/template \
- * --zone=us-east1-d \
- * --parameters \
- * "inputTopic=projects/${PROJECT_ID}/topics/input-topic-name,\
- * outputTableSpec=${PROJECT_ID}:dataset-id.output-table,\
- * outputDeadletterTable=${PROJECT_ID}:dataset-id.deadletter-table"
- *
- * # Execute a pipeline to read from a Subscription.
- * gcloud dataflow jobs run ${JOB_NAME} \
- * --gcs-location=${PIPELINE_FOLDER}/template \
- * --zone=us-east1-d \
- * --parameters \
- * "inputSubscription=projects/${PROJECT_ID}/subscriptions/input-subscription-name,\
- * outputTableSpec=${PROJECT_ID}:dataset-id.output-table,\
- * outputDeadletterTable=${PROJECT_ID}:dataset-id.deadletter-table"
- * </pre>
- */
+
 public class PubSubToBigQuery {
 
   /** The log to output status messages to. */
@@ -270,105 +211,15 @@ public class PubSubToBigQuery {
                     .withoutValidation()
                     .withCreateDisposition(CreateDisposition.CREATE_NEVER)
                     .withWriteDisposition(WriteDisposition.WRITE_APPEND)
-                    .withExtendedErrorInfo()
-                    .withMethod(BigQueryIO.Write.Method.STREAMING_INSERTS)
-                    .withFailedInsertRetryPolicy(InsertRetryPolicy.retryTransientErrors())
+                    .withMethod(BigQueryIO.Write.Method.STORAGE_WRITE_API)
+                    .withNumStorageWriteApiStreams(5)
+                    .withTriggeringFrequency(org.joda.time.Duration.standardSeconds(10))
                     .to(options.getOutputTableSpec()));
-
-    /*
-     * Step 3 Contd.
-     * Elements that failed inserts into BigQuery are extracted and converted to FailsafeElement
-     */
-    PCollection<FailsafeElement<String, String>> failedInserts =
-        writeResult
-            .getFailedInsertsWithErr()
-            .apply(
-                "WrapInsertionErrors",
-                MapElements.into(FAILSAFE_ELEMENT_CODER.getEncodedTypeDescriptor())
-                    .via((BigQueryInsertError e) -> wrapBigQueryInsertError(e)))
-            .setCoder(FAILSAFE_ELEMENT_CODER);
-
-    /*
-     * Step #4: Write records that failed table row transformation
-     * or conversion out to BigQuery deadletter table.
-     */
-    PCollectionList.of(
-            ImmutableList.of(
-                convertedTableRows.get(UDF_DEADLETTER_OUT),
-                convertedTableRows.get(TRANSFORM_DEADLETTER_OUT)))
-        .apply("Flatten", Flatten.pCollections())
-        .apply(
-            "WriteFailedRecords",
-            ErrorConverters.WritePubsubMessageErrors.newBuilder()
-                .setErrorRecordsTable(
-                    ValueProviderUtils.maybeUseDefaultDeadletterTable(
-                        options.getOutputDeadletterTable(),
-                        options.getOutputTableSpec(),
-                        DEFAULT_DEADLETTER_TABLE_SUFFIX))
-                .setErrorRecordsTableSchema(ResourceUtils.getDeadletterTableSchemaJson())
-                .build());
-
-    // 5) Insert records that failed insert into deadletter table
-    failedInserts.apply(
-        "WriteFailedRecords",
-        ErrorConverters.WriteStringMessageErrors.newBuilder()
-            .setErrorRecordsTable(
-                ValueProviderUtils.maybeUseDefaultDeadletterTable(
-                    options.getOutputDeadletterTable(),
-                    options.getOutputTableSpec(),
-                    DEFAULT_DEADLETTER_TABLE_SUFFIX))
-            .setErrorRecordsTableSchema(ResourceUtils.getDeadletterTableSchemaJson())
-            .build());
 
     return pipeline.run();
   }
 
-  /**
-   * If deadletterTable is available, it is returned as is, otherwise outputTableSpec +
-   * defaultDeadLetterTableSuffix is returned instead.
-   */
-  private static ValueProvider<String> maybeUseDefaultDeadletterTable(
-      ValueProvider<String> deadletterTable,
-      ValueProvider<String> outputTableSpec,
-      String defaultDeadLetterTableSuffix) {
-    return DualInputNestedValueProvider.of(
-        deadletterTable,
-        outputTableSpec,
-        new SerializableFunction<TranslatorInput<String, String>, String>() {
-          @Override
-          public String apply(TranslatorInput<String, String> input) {
-            String userProvidedTable = input.getX();
-            String outputTableSpec = input.getY();
-            if (userProvidedTable == null) {
-              return outputTableSpec + defaultDeadLetterTableSuffix;
-            }
-            return userProvidedTable;
-          }
-        });
-  }
 
-  /**
-   * The {@link PubsubMessageToTableRow} class is a {@link PTransform} which transforms incoming
-   * {@link PubsubMessage} objects into {@link TableRow} objects for insertion into BigQuery while
-   * applying an optional UDF to the input. The executions of the UDF and transformation to {@link
-   * TableRow} objects is done in a fail-safe way by wrapping the element with it's original payload
-   * inside the {@link FailsafeElement} class. The {@link PubsubMessageToTableRow} transform will
-   * output a {@link PCollectionTuple} which contains all output and dead-letter {@link
-   * PCollection}.
-   *
-   * <p>The {@link PCollectionTuple} output will contain the following {@link PCollection}:
-   *
-   * <ul>
-   *   <li>{@link PubSubToBigQuery#UDF_OUT} - Contains all {@link FailsafeElement} records
-   *       successfully processed by the optional UDF.
-   *   <li>{@link PubSubToBigQuery#UDF_DEADLETTER_OUT} - Contains all {@link FailsafeElement}
-   *       records which failed processing during the UDF execution.
-   *   <li>{@link PubSubToBigQuery#TRANSFORM_OUT} - Contains all records successfully converted from
-   *       JSON to {@link TableRow} objects.
-   *   <li>{@link PubSubToBigQuery#TRANSFORM_DEADLETTER_OUT} - Contains all {@link FailsafeElement}
-   *       records which couldn't be converted to table rows.
-   * </ul>
-   */
   static class PubsubMessageToTableRow
       extends PTransform<PCollection<PubsubMessage>, PCollectionTuple> {
 
